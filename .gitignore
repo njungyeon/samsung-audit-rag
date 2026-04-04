@@ -1,0 +1,52 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Poetry
+.poetry/
+poetry.toml
+
+# Build/test/cache outputs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Runtime logs
+*.log
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Local databases / artifacts (if used)
+*.sqlite3
+
+# Optional large artifacts
+# data/parsed/
+# data/html/
