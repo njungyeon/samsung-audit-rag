@@ -71,10 +71,12 @@ def format_written_content_template(result: Any) -> str:
 
 
 @lru_cache(maxsize=1)
-def get_qa_helpers() -> tuple[str, Any, Any, Any, Any, Any]:
+def get_qa_helpers() -> tuple[Any, ...]:
     from app.qa import (
         SYSTEM_PROMPT,
+        FINANCIAL_STATEMENT_SQL_PROMPT,
         build_rag_user_prompt,
+        build_financial_statement_sql_user_prompt,
         clean_generated_answer,
         format_context,
         generate_grounded_answer,
@@ -83,7 +85,9 @@ def get_qa_helpers() -> tuple[str, Any, Any, Any, Any, Any]:
 
     return (
         SYSTEM_PROMPT,
+        FINANCIAL_STATEMENT_SQL_PROMPT,
         build_rag_user_prompt,
+        build_financial_statement_sql_user_prompt,
         clean_generated_answer,
         format_context,
         generate_grounded_answer,
@@ -105,7 +109,7 @@ def get_generator() -> RagAnswerGenerator:
 
 def tool_search_audit_report(query: str, k: int = 3) -> str:
     retrieve = get_retrieve_func()
-    _, _, _, format_context, _, _ = get_qa_helpers()
+    _, _, _, _, _, format_context, _, _ = get_qa_helpers()
     result = retrieve(query)
     rows = result.rows[: max(1, min(k, 5))]
     if not rows:
@@ -115,7 +119,7 @@ def tool_search_audit_report(query: str, k: int = 3) -> str:
 
 def tool_get_specific_section(report_year: int, sub_section: str, k: int = 3) -> str:
     retrieve = get_retrieve_func()
-    _, _, _, format_context, _, _ = get_qa_helpers()
+    _, _, _, _, _, format_context, _, _ = get_qa_helpers()
     query = f"{report_year}년도 {sub_section}"
     result = retrieve(query, report_year=report_year, sub_section=sub_section)
     rows = result.rows[: max(1, min(k, 5))]
@@ -270,7 +274,17 @@ def run_agentic_react(user_query: str, max_turns: int = 4) -> tuple[list[dict[st
 
 def stream_rag_answer(user_query: str, thinking: bool = False):
     retrieve = get_retrieve_func()
-    system_prompt, build_rag_user_prompt, clean_generated_answer, _, generate_grounded_answer, trim_streaming_artifacts = get_qa_helpers()
+    (
+        system_prompt,
+        financial_statement_sql_prompt,
+        build_rag_user_prompt,
+        build_financial_statement_sql_user_prompt,
+        clean_generated_answer,
+        _,
+        generate_grounded_answer,
+        trim_streaming_artifacts,
+    ) = get_qa_helpers()
+
     generator = get_generator()
     result = retrieve(user_query)
 
@@ -280,9 +294,17 @@ def stream_rag_answer(user_query: str, thinking: bool = False):
             yield grounded
         return
 
+    # 재무제표 SQL 질의는 스트리밍에서도 전용 프롬프트 사용
+    if result.auto_section_type == "financial_statement_sql":
+        prompt_system = financial_statement_sql_prompt.strip()
+        prompt_user = build_financial_statement_sql_user_prompt(result)
+    else:
+        prompt_system = system_prompt.strip()
+        prompt_user = build_rag_user_prompt(result)
+
     streamer, thread = generator.stream_generate(
-        system_prompt.strip(),
-        build_rag_user_prompt(result),
+        prompt_system,
+        prompt_user,
         thinking=thinking,
     )
 
@@ -300,14 +322,21 @@ def stream_rag_answer(user_query: str, thinking: bool = False):
                 yield delta
     thread.join()
 
-    if not shown:
+    final_cleaned = clean_generated_answer(raw)
+    if not final_cleaned:
         grounded = generate_grounded_answer(result)
         if grounded:
             yield grounded
+            return
+
+    if final_cleaned != shown:
+        suffix = final_cleaned[len(shown):] if final_cleaned.startswith(shown) else final_cleaned
+        if suffix:
+            yield suffix
 
 
 def stream_agent_answer(user_query: str):
-    _, _, clean_generated_answer, _, generate_grounded_answer, trim_streaming_artifacts = get_qa_helpers()
+    _, _, _, _, clean_generated_answer, _, generate_grounded_answer, trim_streaming_artifacts = get_qa_helpers()
     retrieve = get_retrieve_func()
 
     compact_query = re.sub(r"\s+", "", user_query)
@@ -357,7 +386,7 @@ with st.sidebar:
     mode = st.radio(
         "응답 모드",
         options=["RAG 스트리밍", "Agent(ReAct) 스트리밍"],
-        index=1,
+        index=0,
     )
     thinking = st.toggle("Thinking 모드(Qwen)", value=False, disabled=(mode != "RAG 스트리밍"))
     st.markdown("---")

@@ -237,9 +237,17 @@ def generate_answer(result: SearchResult, thinking: bool = False) -> tuple[str, 
 
 def stream_answer(result: SearchResult, thinking: bool = False) -> str:
     generator = get_generator()
+
+    if result.auto_section_type == "financial_statement_sql":
+        system_prompt = FINANCIAL_STATEMENT_SQL_PROMPT.strip()
+        user_prompt = build_financial_statement_sql_user_prompt(result)
+    else:
+        system_prompt = SYSTEM_PROMPT.strip()
+        user_prompt = build_rag_user_prompt(result)
+
     streamer, thread = generator.stream_generate(
-        SYSTEM_PROMPT.strip(),
-        build_rag_user_prompt(result),
+        system_prompt,
+        user_prompt,
         thinking=thinking,
     )
 
@@ -258,10 +266,12 @@ def stream_answer(result: SearchResult, thinking: bool = False) -> str:
     cleaned = clean_generated_answer("".join(chunks))
     if not cleaned:
         cleaned = build_fallback_answer(result)
+
     if cleaned != shown:
         suffix = cleaned[len(shown):] if cleaned.startswith(shown) else cleaned
         if suffix:
             print(suffix, end="", flush=True)
+
     print()
     return cleaned
 
