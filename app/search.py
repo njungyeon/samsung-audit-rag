@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from difflib import get_close_matches
+from functools import lru_cache
 
 from dataclasses import dataclass, field
 import re
@@ -110,6 +111,16 @@ DOMAIN_KEYWORD_HINTS = {
 }
 
 MIN_SUPPLEMENTAL_ANCHOR_LEN = 4
+
+
+@lru_cache(maxsize=1)
+def get_reranker() -> Reranker:
+    return Reranker()
+
+
+@lru_cache(maxsize=1)
+def get_embedder() -> Embedder:
+    return Embedder()
 
 
 def has_row_label_hint(query: str) -> bool:
@@ -765,7 +776,7 @@ def retrieve(query: str, report_year: int | None = None, sub_section: str | None
             if auto_sub_section_compact is None and preferred_sub_section is not None:
                 auto_sub_section_compact = normalize_search_query(preferred_sub_section)
 
-    embedder = Embedder()
+    embedder = get_embedder()
     vector = embedder.encode_texts([semantic_query])[0]
 
     preferred_account_compact = preferred_account or ""
@@ -879,7 +890,7 @@ def retrieve(query: str, report_year: int | None = None, sub_section: str | None
 
     rerank_applied = False
     if rows:
-        reranker = Reranker()
+        reranker = get_reranker()
         try:
             rows, rerank_applied = reranker.rerank(semantic_query, rows)
         except Exception as exc:
