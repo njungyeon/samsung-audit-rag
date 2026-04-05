@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from difflib import get_close_matches
+
 from dataclasses import dataclass, field
 import re
 import sys
@@ -57,6 +59,13 @@ FS_ACCOUNT_HINTS = {
     "현금및현금성자산": "재무상태표",
     "매출채권": "재무상태표",
     "재고자산": "재무상태표",
+}
+
+FS_SQL_NUMERIC_HINTS = {"얼마", "금액", "값", "잔액", "각각", "비교", "증가", "감소"}
+NOTE_HEAVY_HINTS = {
+    "변동", "변동내역", "내역", "구성", "중", "기초", "기말",
+    "상환", "상환계획", "환입", "대손", "충당부채", "리스부채",
+    "사용제한금융상품", "판매보증충당부채"
 }
 
 ACCOUNT_QUERY_ALIASES = {
@@ -296,6 +305,124 @@ QUERY_NOISE_PATTERNS = [
         r"인가요|입니까|이야|야$",
     )
 ]
+
+def fetch_fs_accounts() -> list[str]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT account_name_normalized
+                FROM financial_statement_rows
+                WHERE account_name_normalized IS NOT NULL
+            """)
+            rows = cur.fetchall()
+    return [str(row["account_name_normalized"]) for row in rows if row["account_name_normalized"]]
+
+
+def match_financial_accounts(query: str) -> list[str]:
+    compact = normalize_search_query(query)
+    accounts = fetch_fs_accounts()
+
+    exact_matches = [acc for acc in accounts if acc and acc in compact]
+    if exact_matches:
+        return sorted(set(exact_matches), key=len, reverse=True)
+
+    token_source = re.sub(r"[^0-9A-Za-z가-힣]+", " ", query)
+    tokens = [normalize_search_query(tok) for tok in token_source.split() if tok.strip()]
+    tokens = [tok for tok in tokens if len(tok) >= 2]
+
+    fuzzy_matches = []
+    for token in sorted(tokens, key=len, reverse=True):
+        matched = get_close_matches(token, accounts, n=3, cutoff=0.92)
+        fuzzy_matches.extend(matched)
+
+    return sorted(set(fuzzy_matches), key=len, reverse=True)
+
+
+def classify_query_route(query: str, report_year: int | None, accounts: list[str]) -> str:
+    compact = normalize_search_query(query)
+
+    has_note_hint = any(hint in compact for hint in NOTE_HEAVY_HINTS)
+    has_numeric_hint = any(hint in compact for hint in FS_SQL_NUMERIC_HINTS)
+
+    if has_note_hint:
+        return "rag_only"
+
+    if report_year is not None and accounts and has_numeric_hint:
+        return "fs_sql_first"
+
+    return "rag_only"
+
+
+def query_financial_statement_rows(
+    *,
+    report_year: int,
+    account_names_normalized: list[str],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    sql = """
+        SELECT
+            report_year,
+            statement_type,
+            account_name,
+            account_name_normalized,
+            parent_account_name_normalized,
+            hierarchy_level,
+            is_total,
+            current_amount,
+            prior_amount
+        FROM financial_statement_rows
+        WHERE report_year = %s
+          AND account_name_normalized = ANY(%s)
+        ORDER BY
+            account_name_normalized,
+            is_total DESC,
+            hierarchy_level ASC NULLS LAST
+        LIMIT %s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (report_year, account_names_normalized, limit))
+            rows = cur.fetchall()
+    return list(rows)
+
+
+def build_fs_sql_rows(fs_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+
+    for row in fs_rows:
+        content = (
+            f"[재무제표 구조화 데이터]\n"
+            f"계정명: {row.get('account_name')}\n"
+            f"정규화계정명: {row.get('account_name_normalized')}\n"
+            f"재무제표: {row.get('statement_type')}\n"
+            f"당기금액: {row.get('current_amount')}\n"
+            f"전기금액: {row.get('prior_amount')}\n"
+            f"상위계정명: {row.get('parent_account_name_normalized')}\n"
+            f"계층레벨: {row.get('hierarchy_level')}\n"
+            f"총계여부: {row.get('is_total')}"
+        )
+        converted.append(
+            {
+                "file_name": "[financial_statement_rows]",
+                "report_year": row.get("report_year"),
+                "major_section": "(첨부)재무제표",
+                "sub_section": row.get("statement_type"),
+                "section_type": "financial_statement_sql_row",
+                "note_no": None,
+                "note_title": None,
+                "topic": row.get("account_name_normalized"),
+                "chunk_key": f"fs_sql::{row.get('report_year')}::{row.get('statement_type')}::{row.get('account_name_normalized')}",
+                "content": content,
+                "semantic_score": 1.0,
+                "keyword_score": 1.0,
+                "exact_match_score": 1.0,
+                "hybrid_score": 1.0,
+                "structured_match_score": 10.0,
+                "keyword_coverage_score": 10.0,
+            }
+        )
+
+    return converted
 
 # 문맥 정보 제거 패턴 (임베딩의 노이즈 감소)
 CONTEXTUAL_NOISE_PATTERNS = [
@@ -561,6 +688,29 @@ def retrieve(query: str, report_year: int | None = None, sub_section: str | None
 
     if not semantic_query:
         semantic_query = remove_contextual_noise(query)
+
+    matched_accounts = match_financial_accounts(query)
+    route = classify_query_route(query, report_year, matched_accounts)
+
+    if route == "fs_sql_first" and report_year is not None and matched_accounts:
+        fs_rows = query_financial_statement_rows(
+            report_year=report_year,
+            account_names_normalized=matched_accounts,
+            limit=10,
+        )
+        if fs_rows:
+            return SearchResult(
+                original_query=query,
+                semantic_query=semantic_query,
+                report_year=report_year,
+                auto_year_applied=auto_year_applied,
+                auto_section_type="financial_statement_sql",
+                rerank_applied=False,
+                candidate_keywords=[matched_accounts],
+                resolved_anchors=[],
+                selected_keywords=[matched_accounts],
+                rows=build_fs_sql_rows(fs_rows),
+            )
 
     candidate_keywords = extract_candidate_keywords(query)
     primary_keywords, support_keywords = split_query_keywords(candidate_keywords)
