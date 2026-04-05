@@ -24,7 +24,7 @@ jobs:
         run: pip install poetry
 
       - name: Install dependencies
-        run: poetry install —with dev —no-interaction
+        run: poetry install --with dev --no-interaction
 
       - name: Run data schema tests
         run: poetry run pytest tests/test_data_schema.py -v
