@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+from app.db import get_conn
+
 from difflib import get_close_matches
 from functools import lru_cache
 
@@ -243,6 +246,63 @@ def resolve_query_anchors(candidates: list[str], report_year: int | None) -> lis
             rows = cur.fetchall()
 
     return [(str(row["keyword"]), int(row["anchor_score"])) for row in rows]
+
+
+def lookup_note_table_value(
+    *,
+    report_year: int | None = None,
+    note_title: str | None = None,
+    row_label: str | None = None,
+    col_label: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = ["c.section_type = 'note_table_cell'"]
+    params: list[Any] = []
+
+    if report_year is not None:
+        clauses.append("c.report_year = %s")
+        params.append(report_year)
+
+    if note_title:
+        clauses.append("regexp_replace(COALESCE(c.note_title, ''), '\\s+', '', 'g') LIKE %s")
+        params.append(f"%{note_title.replace(' ', '')}%")
+
+    if row_label:
+        clauses.append("regexp_replace(COALESCE(c.content, ''), '\\s+', '', 'g') LIKE %s")
+        params.append(f"%행:{row_label.replace(' ', '')}%")
+
+    if col_label:
+        clauses.append("regexp_replace(COALESCE(c.content, ''), '\\s+', '', 'g') LIKE %s")
+        params.append(f"%열:{col_label.replace(' ', '')}%")
+
+    where_sql = " AND ".join(clauses)
+
+    sql = f"""
+        SELECT
+            d.file_name,
+            c.report_year,
+            c.major_section,
+            c.sub_section,
+            c.section_type,
+            c.note_no,
+            c.note_title,
+            c.topic,
+            c.chunk_key,
+            c.content
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE {where_sql}
+        ORDER BY c.report_year DESC, c.note_no ASC
+        LIMIT %s
+    """
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    return list(rows)
 
 
 def select_anchor_keywords(resolved_anchors: list[tuple[str, int]]) -> list[str]:
