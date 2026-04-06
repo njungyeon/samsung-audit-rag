@@ -146,6 +146,64 @@ def iter_section_nodes(header_tag: Tag) -> Iterable[Tag]:
         yield sib
 
 
+def _table_to_grid(table_tag: Tag) -> list[list[str]]:
+    """
+    HTML table -> 2차원 grid 로 펼친다.
+    rowspan / colspan 을 반영해서 병합 셀도 실제 좌표에 맞게 채운다.
+    """
+    grid: list[list[str]] = []
+    pending_spans: dict[tuple[int, int], str] = {}
+
+    trs = table_tag.find_all("tr")
+    for r_idx, tr in enumerate(trs):
+        row: list[str] = []
+        c_idx = 0
+
+        # 이전 row의 rowspan 잔여분 먼저 채운다
+        while (r_idx, c_idx) in pending_spans:
+            row.append(pending_spans.pop((r_idx, c_idx)))
+            c_idx += 1
+
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if not cells:
+            cells = tr.find_all(["th", "td"])
+
+        for cell in cells:
+            while (r_idx, c_idx) in pending_spans:
+                row.append(pending_spans.pop((r_idx, c_idx)))
+                c_idx += 1
+
+            text = tag_text(cell)
+            rowspan = int(cell.get("rowspan", 1) or 1)
+            colspan = int(cell.get("colspan", 1) or 1)
+
+            for dx in range(colspan):
+                row.append(text if text else "")
+                # 아래 row로 span 예약
+                for dy in range(1, rowspan):
+                    pending_spans[(r_idx + dy, c_idx + dx)] = text if text else ""
+            c_idx += colspan
+
+        # 행 끝에도 rowspan 잔여분이 있으면 채운다
+        while (r_idx, c_idx) in pending_spans:
+            row.append(pending_spans.pop((r_idx, c_idx)))
+            c_idx += 1
+
+        grid.append(row)
+
+    if not grid:
+        return []
+
+    max_cols = max(len(row) for row in grid)
+    normalized_grid: list[list[str]] = []
+    for row in grid:
+        if len(row) < max_cols:
+            row = row + [""] * (max_cols - len(row))
+        normalized_grid.append([normalize_space(x) for x in row])
+
+    return normalized_grid
+
+
 def table_rows_to_text(table_tag: Tag) -> str:
     lines: list[str] = []
     for tr in table_tag.find_all("tr"):
@@ -156,6 +214,25 @@ def table_rows_to_text(table_tag: Tag) -> str:
                 row.append(txt)
         if row:
             lines.append(" | ".join(row))
+    return "\n".join(lines).strip()
+
+
+def table_rows_to_text_preserve_structure(table_tag: Tag) -> str:
+    """
+    표를 pipe text 로 변환하되,
+    rowspan/colspan 을 반영한 grid 기반으로 직렬화한다.
+    """
+    grid = _table_to_grid(table_tag)
+    if not grid:
+        return ""
+
+    lines: list[str] = []
+    for row in grid:
+        # 완전 빈 행은 제거
+        if not any(normalize_space(cell) for cell in row):
+            continue
+        lines.append(" | ".join(cell if cell is not None else "" for cell in row))
+
     return "\n".join(lines).strip()
 
 
@@ -573,6 +650,152 @@ def _row_has_numeric_values(parts: list[str], start_idx: int = 1) -> bool:
     return False
 
 
+def _split_pipe_row(line: str) -> list[str]:
+    return [normalize_space(x) for x in str(line).split("|")]
+
+
+def _pad_rows(rows: list[list[str]]) -> list[list[str]]:
+    if not rows:
+        return rows
+    max_len = max(len(r) for r in rows)
+    return [r + [""] * (max_len - len(r)) for r in rows]
+
+
+def _is_effective_empty_row(row: list[str]) -> bool:
+    return not any(normalize_space(x) for x in row)
+
+
+def _count_non_empty(row: list[str]) -> int:
+    return sum(1 for x in row if normalize_space(x))
+
+
+def _is_group_row(row: list[str]) -> bool:
+    """
+    표 내부 그룹 행 판단:
+    예) '단기차입금: | | | |'
+        '(1) 법정적립금: | |'
+        '(2) 임의적립금: | |'
+    """
+    non_empty = [normalize_space(x) for x in row if normalize_space(x)]
+    if not non_empty:
+        return False
+    if len(non_empty) != 1:
+        return False
+
+    txt = non_empty[0]
+    # 숫자 데이터가 아니고, 보통 ':' 또는 항목 구분 패턴
+    if parse_numeric(txt) is not None:
+        return False
+    if txt.endswith(":"):
+        return True
+    if re.match(r"^\(\d+\)\s*", txt):
+        return True
+    if re.match(r"^[가-하]\.\s*", txt):
+        return True
+    return False
+
+
+def _looks_like_header_row(row: list[str]) -> bool:
+    """
+    헤더 후보 판단:
+    숫자보다 텍스트 중심이고, group row 는 제외
+    """
+    if _is_group_row(row):
+        return False
+
+    non_empty = [normalize_space(x) for x in row if normalize_space(x)]
+    if not non_empty:
+        return False
+
+    numeric_count = sum(1 for x in non_empty if parse_numeric(x) is not None)
+    # 헤더는 대체로 숫자가 거의 없다
+    return numeric_count == 0
+
+
+def _normalize_header_matrix(header_rows: list[list[str]]) -> list[list[str]]:
+    """
+    rowspan 펼침으로 인해 같은 헤더가 반복된 상태를 정리한다.
+    예:
+      ['구분','차입처','연이자율(%)','금액','금액']
+      ['구분','차입처','당기말','당기말','전기말']
+    """
+    header_rows = _pad_rows(header_rows)
+    normalized = []
+
+    for r_idx, row in enumerate(header_rows):
+        new_row = []
+        for c_idx, cell in enumerate(row):
+            cell_norm = normalize_table_label(cell)
+            # 바로 위와 동일하면 하위헤더가 아니라 span 복제일 수 있음
+            if r_idx > 0:
+                upper = normalize_table_label(header_rows[r_idx - 1][c_idx])
+                if cell_norm == upper:
+                    cell_norm = ""
+            new_row.append(cell_norm)
+        normalized.append(new_row)
+
+    return normalized
+
+
+def _build_column_map_from_headers(header_rows: list[list[str]]) -> list[dict[str, str]]:
+    """
+    1단/2단 헤더를 컬럼 인덱스 기준으로 매핑한다.
+    """
+    if not header_rows:
+        return []
+
+    header_rows = _normalize_header_matrix(header_rows)
+    col_count = max(len(r) for r in header_rows)
+
+    col_map: list[dict[str, str]] = []
+    for c_idx in range(col_count):
+        parts: list[str] = []
+        raw_parts: list[str] = []
+
+        for r in header_rows:
+            raw = r[c_idx] if c_idx < len(r) else ""
+            raw_parts.append(raw)
+            norm = normalize_table_label(raw)
+            if norm and (not parts or parts[-1] != norm):
+                parts.append(norm)
+
+        if not parts:
+            flat = f"col{c_idx + 1}"
+            parent = ""
+            child = ""
+        elif len(parts) == 1:
+            flat = parts[0]
+            parent = parts[0]
+            child = ""
+        else:
+            parent = parts[0]
+            child = parts[-1]
+            flat = normalize_table_label("".join(parts))
+
+        col_map.append(
+            {
+                "parent": parent,
+                "child": child,
+                "flat": flat,
+            }
+        )
+
+    return col_map
+
+
+def _is_section_like_row(row: list[str]) -> bool:
+    """
+    group보다는 약하지만 section 역할 하는 row
+    ex) 배당금액, 배당받을 주식
+    """
+    non_empty = [x for x in row if normalize_space(x)]
+    if len(non_empty) == 1:
+        txt = normalize_space(non_empty[0])
+        if parse_numeric(txt) is None:
+            return True
+    return False
+
+
 def parse_note_table_matrix(table_text: str, inherited_unit: str | None = None) -> dict[str, Any] | None:
     lines = [normalize_space(line) for line in str(table_text).splitlines() if normalize_space(line)]
     if not lines:
@@ -590,71 +813,64 @@ def parse_note_table_matrix(table_text: str, inherited_unit: str | None = None) 
     if len(pipe_lines) < 2:
         return None
 
-    pipe_rows = [[normalize_space(x) for x in line.split("|")] for line in pipe_lines]
+    pipe_rows = [_split_pipe_row(line) for line in pipe_lines]
+    pipe_rows = _pad_rows(pipe_rows)
+    pipe_rows = [row for row in pipe_rows if not _is_effective_empty_row(row)]
 
-    header_cells = pipe_rows[0]
-    if len(header_cells) < 2:
+    if len(pipe_rows) < 2:
         return None
 
-    normalized_headers = [normalize_table_label(cell) for cell in header_cells]
+    # header row 수를 1~2개 정도로 추정
+    header_rows: list[list[str]] = []
+    data_rows: list[list[str]] = []
 
-    sub_header_cells: list[str] | None = None
-    data_rows = pipe_rows[1:]
-    if len(pipe_rows) >= 3:
-        candidate_sub_header = pipe_rows[1]
-        candidate_first_data = pipe_rows[2]
-        is_two_level_header = (
-            not _row_has_numeric_values(candidate_sub_header, start_idx=0)
-            and _row_has_numeric_values(candidate_first_data)
-            and (len(candidate_first_data) - 1) > (len(header_cells) - 1)
-        )
-        if is_two_level_header:
-            sub_header_cells = candidate_sub_header
-            data_rows = pipe_rows[2:]
+    for idx, row in enumerate(pipe_rows):
+        if idx < 2 and _looks_like_header_row(row):
+            header_rows.append(row)
+            continue
+        data_rows = pipe_rows[idx:]
+        break
 
-    value_col_count = max((max(0, len(parts) - 1) for parts in data_rows), default=0)
-    if value_col_count <= 0:
+    if not header_rows:
+        header_rows = [pipe_rows[0]]
+        data_rows = pipe_rows[1:]
+
+    if not data_rows:
         return None
 
-    column_map: list[tuple[str, str, str]] = []
-    if sub_header_cells is not None:
-        parent_labels = normalized_headers[1:]
-        expanded_parents: list[str] = []
-        if parent_labels and value_col_count % len(parent_labels) == 0:
-            repeat = value_col_count // len(parent_labels)
-            for parent in parent_labels:
-                expanded_parents.extend([parent] * repeat)
-        else:
-            for idx in range(value_col_count):
-                src_idx = min(idx + 1, len(normalized_headers) - 1)
-                expanded_parents.append(normalized_headers[src_idx] if src_idx >= 1 else "")
+    column_map = _build_column_map_from_headers(header_rows)
+    if not column_map:
+        return None
 
-        child_headers = [normalize_table_label(cell) for cell in sub_header_cells]
-        if len(child_headers) == value_col_count + 1:
-            child_headers = child_headers[1:]
-        elif len(child_headers) < value_col_count:
-            child_headers.extend([""] * (value_col_count - len(child_headers)))
-        else:
-            child_headers = child_headers[:value_col_count]
-
-        for idx in range(value_col_count):
-            parent = expanded_parents[idx] if idx < len(expanded_parents) else ""
-            child = child_headers[idx] if idx < len(child_headers) else ""
-            flat = normalize_table_label(f"{parent}{child}") or normalize_table_label(parent) or normalize_table_label(child)
-            column_map.append((parent, child, flat))
-    else:
-        for idx in range(value_col_count):
-            src_idx = min(idx + 1, len(header_cells) - 1)
-            col_raw = header_cells[src_idx] if src_idx >= 1 else ""
-            col_label = normalize_table_label(col_raw) or normalize_table_label(normalized_headers[src_idx])
-            column_map.append((col_label, "", col_label))
-
+    # 첫 번째 컬럼은 row label 로 쓰는 경우가 많으므로 따로 본다.
+    # 다만 값 컬럼 매핑은 2번째 컬럼부터 그대로 사용한다.
     rows: list[dict[str, Any]] = []
-    for parts in data_rows:
-        if len(parts) < 2:
+    current_group: str | None = None
+    row_stack: list[str] = []
+
+    for row in data_rows:
+        if _is_effective_empty_row(row):
             continue
 
-        row_label_raw = parts[0]
+        # 1️⃣ group row
+        if _is_group_row(row):
+            txt = next((x for x in row if normalize_space(x)), None)
+            current_group = txt
+            row_stack = [txt] if txt else []
+            continue
+
+        # 2️⃣ section row (중간 계층)
+        if _is_section_like_row(row):
+            txt = next((x for x in row if normalize_space(x)), None)
+            if txt:
+                # 깊이 유지하면서 append
+                if len(row_stack) >= 2:
+                    row_stack = row_stack[:1]  # 너무 깊어지지 않게
+                row_stack.append(txt)
+            continue
+
+        # 3️⃣ 실제 데이터 row
+        row_label_raw = row[0] if row else ""
         row_label = normalize_table_label(row_label_raw)
         if not row_label:
             continue
@@ -662,44 +878,73 @@ def parse_note_table_matrix(table_text: str, inherited_unit: str | None = None) 
         values: dict[str, Any] = {}
         raw_values: dict[str, Any] = {}
 
-        for pos, value_text in enumerate(parts[1:]):
-            if pos >= len(column_map):
-                break
-            parent_label, child_label, flat_label = column_map[pos]
+        for c_idx in range(1, len(row)):
+            value_text = row[c_idx]
+            meta = column_map[c_idx] if c_idx < len(column_map) else {
+                "parent": "",
+                "child": "",
+                "flat": f"col{c_idx + 1}",
+            }
 
-            if sub_header_cells is not None and parent_label:
-                child_key = child_label or f"col{pos + 1}"
-                parent_raw = raw_values.setdefault(parent_label, {})
-                parent_num = values.setdefault(parent_label, {})
+            parent = meta["parent"]
+            child = meta["child"]
+            flat = meta["flat"]
+
+            if not flat:
+                flat = f"col{c_idx + 1}"
+
+            # 2단 헤더면 parent > child 구조로 저장
+            if child:
+                parent_key = parent or flat
+                child_key = child or f"col{c_idx + 1}"
+
+                parent_raw = raw_values.setdefault(parent_key, {})
+                parent_num = values.setdefault(parent_key, {})
+
                 if isinstance(parent_raw, dict) and isinstance(parent_num, dict):
                     parent_raw[child_key] = value_text
                     parent_num[child_key] = parse_numeric(value_text)
             else:
-                if not flat_label:
-                    continue
-                raw_values[flat_label] = value_text
-                values[flat_label] = parse_numeric(value_text)
+                raw_values[flat] = value_text
+                values[flat] = parse_numeric(value_text)
 
-        if values:
-            rows.append(
-                {
-                    "row_label": row_label,
-                    "row_label_raw": row_label_raw,
-                    "values": values,
-                    "raw_values": raw_values,
-                }
-            )
+        row_path = []
+
+        if current_group:
+            row_path.append(normalize_space(current_group))
+
+        if len(row_stack) > 1:
+            row_path.extend([normalize_space(x) for x in row_stack[1:]])
+
+        row_path.append(row_label)
+
+        row_item = {
+            "row_label": row_label,
+            "row_label_raw": row_label_raw,
+            "row_path": row_path,
+            "values": values,
+            "raw_values": raw_values,
+        }
+
+        if current_group:
+            row_item["row_group"] = normalize_space(current_group)
+            row_item["row_group_raw"] = current_group
+
+        rows.append(row_item)
 
     if not rows:
         return None
 
+    header_raw = header_rows[0] if header_rows else []
+    sub_header_raw = header_rows[1] if len(header_rows) >= 2 else None
+
     return {
         "table_type": "matrix",
         "unit": unit,
-        "header": [normalize_table_label(h) for h in header_cells],
-        "header_raw": header_cells,
-        "sub_header": [normalize_table_label(h) for h in sub_header_cells] if sub_header_cells else None,
-        "sub_header_raw": sub_header_cells,
+        "header": [normalize_table_label(h) for h in header_raw],
+        "header_raw": header_raw,
+        "sub_header": [normalize_table_label(h) for h in sub_header_raw] if sub_header_raw else None,
+        "sub_header_raw": sub_header_raw,
         "rows": rows,
         "raw_text": "\n".join(pipe_lines),
     }
@@ -1166,7 +1411,7 @@ def extract_financial_sections(major_nodes: list[Tag]) -> tuple[list[dict[str, A
             if node.name == "p" and "PGBRK" in (node.get("class") or []):
                 continue
             if node.name == "table":
-                text = table_rows_to_text(node)
+                text = table_rows_to_text_preserve_structure(node)
                 if text:
                     note_blocks.append({"block_type": "table", "text": text})
             else:
