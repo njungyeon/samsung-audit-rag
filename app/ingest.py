@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tqdm import tqdm
+
 
 from app.chunker import build_chunks
 from app.config import settings
@@ -30,7 +32,7 @@ def upsert_document(cur, report) -> int:
             report.report_year,
             str(report.file_path),
             report.raw_html,
-            __import__('json').dumps(report.structured, ensure_ascii=False),
+            json.dumps(report.structured, ensure_ascii=False),
         ),
     )
     return cur.fetchone()["id"]
@@ -76,21 +78,110 @@ def replace_chunks(cur, document_id: int, report, chunks, embeddings, embedding_
             ),
         )
 
+def extract_financial_statement_rows(report) -> list[dict]:
+    rows: list[dict] = []
+    report_year = report.report_year
+
+    for major in report.structured.get("major_sections", []):
+        if major.get("major_type") != "financial_statements_bundle":
+            continue
+
+        for section in major.get("sections", []):
+            if section.get("section_type") != "financial_statement":
+                continue
+
+            statement_type = section.get("title")
+            table_rows = section.get("table_rows", []) or []
+
+            row_id_to_account = {}
+            for row in table_rows:
+                row_id = row.get("row_id")
+                account_normalized = row.get("account_name_normalized")
+                if row_id and account_normalized:
+                    row_id_to_account[row_id] = account_normalized
+
+            for row in table_rows:
+                parent_row_id = row.get("parent_row_id")
+                parent_account_name_normalized = row_id_to_account.get(parent_row_id)
+
+                rows.append(
+                    {
+                        "report_year": report_year,
+                        "statement_type": statement_type,
+                        "account_name": row.get("account_name"),
+                        "account_name_normalized": row.get("account_name_normalized"),
+                        "parent_account_name_normalized": parent_account_name_normalized,
+                        "hierarchy_level": row.get("hierarchy_level"),
+                        "is_total": row.get("is_total", False),
+                        "current_amount": row.get("current_amount"),
+                        "prior_amount": row.get("prior_amount"),
+                    }
+                )
+
+    return rows
+
+
+def replace_financial_statement_rows(cur, document_id: int, rows: list[dict]) -> None:
+    cur.execute(
+        "DELETE FROM financial_statement_rows WHERE document_id = %s",
+        (document_id,),
+    )
+
+    for row in rows:
+        cur.execute(
+            """
+            INSERT INTO financial_statement_rows (
+                document_id,
+                report_year,
+                statement_type,
+                account_name,
+                account_name_normalized,
+                parent_account_name_normalized,
+                hierarchy_level,
+                is_total,
+                current_amount,
+                prior_amount
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                document_id,
+                row["report_year"],
+                row["statement_type"],
+                row["account_name"],
+                row["account_name_normalized"],
+                row["parent_account_name_normalized"],
+                row["hierarchy_level"],
+                row["is_total"],
+                row["current_amount"],
+                row["prior_amount"],
+            ),
+        )
+
 
 def ingest_one(html_path: Path, embedder: Embedder) -> None:
+    print(f"\n[INGEST] {html_path.name}")
     report = parse_html_file(html_path)
     save_parsed_json(report, settings.parsed_dir)
+
     chunks = build_chunks(report)
-    if not chunks:
-        print(f"[SKIP] {html_path.name}: usable chunk가 없습니다.")
+    fs_rows = extract_financial_statement_rows(report)
+
+    if not chunks and not fs_rows:
+        print(f"[SKIP] {html_path.name}: usable data가 없습니다.")
         return
 
-    embeddings = embedder.encode_texts([chunk.content for chunk in chunks])
+    embeddings = embedder.encode_texts([chunk.content for chunk in chunks]) if chunks else []
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             document_id = upsert_document(cur, report)
-            replace_chunks(cur, document_id, report, chunks, embeddings, embedder.model_name)
+
+            if chunks:
+                replace_chunks(cur, document_id, report, chunks, embeddings, embedder.model_name)
+
+            if fs_rows:
+                replace_financial_statement_rows(cur, document_id, fs_rows)
 
     print(
         f"[DONE] {html_path.name} | parser={report.parser_used} | year={report.report_year} | chunks={len(chunks)}"

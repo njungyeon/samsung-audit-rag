@@ -59,6 +59,44 @@ def format_context(rows: list[dict[str, object]], max_sources: int = 1) -> str:
     return "\n\n".join(blocks)
 
 
+def format_financial_statement_sql_context(result: SearchResult) -> str:
+    lines: list[str] = []
+
+    if result.report_year is not None:
+        lines.append(f"{result.report_year}년 재무제표 조회 결과")
+
+    for row in result.rows:
+        account = str(row.get("topic") or row.get("account_name_normalized") or "항목")
+        statement_type = str(row.get("sub_section") or "재무제표")
+        content = str(row.get("content") or "")
+
+        current_amount = None
+        prior_amount = None
+
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("당기금액:"):
+                current_amount = line.replace("당기금액:", "").strip()
+            elif line.startswith("전기금액:"):
+                prior_amount = line.replace("전기금액:", "").strip()
+
+        try:
+            current_amount_fmt = f"{int(float(current_amount)):,}" if current_amount not in (None, "", "None") else "-"
+        except Exception:
+            current_amount_fmt = str(current_amount)
+
+        try:
+            prior_amount_fmt = f"{int(float(prior_amount)):,}" if prior_amount not in (None, "", "None") else "-"
+        except Exception:
+            prior_amount_fmt = str(prior_amount)
+
+        lines.append(
+            f"- {statement_type} | {account} | 당기 {current_amount_fmt} | 전기 {prior_amount_fmt}"
+        )
+
+    return "\n".join(lines)
+
+
 def build_rag_user_prompt(result: SearchResult) -> str:
     context = format_context(result.rows, max_sources=1)
     task_lines = [
@@ -66,6 +104,8 @@ def build_rag_user_prompt(result: SearchResult) -> str:
         "- '근거 1', '근거 2', '출처 1', '출처 2' 같은 라벨 나열/복붙을 금지한다.",
         "- 응답 본문에 출처, 파일명, chunk_key 같은 메타데이터를 쓰지 않는다.",
         "- 확인 가능한 정보만 답하고 과도한 단정은 피하라.",
+        "- 검색 근거의 금액이 괄호 표기(예: (1,010,632)) 또는 음수(-1,010,632)면 부호를 절대 바꾸지 말고 그대로 유지하라.",
+        "- 금액 단위(예: 백만원)가 근거에 있으면 최종 답변에도 동일 단위를 반드시 유지하라.",
     ]
     if SINGLE_VALUE_QUERY_HINT_RE.search(result.original_query) and not MULTI_VALUE_QUERY_HINT_RE.search(result.original_query):
         task_lines.extend(
@@ -98,9 +138,97 @@ def get_generator() -> RagAnswerGenerator:
     return RagAnswerGenerator()
 
 
+FINANCIAL_STATEMENT_SQL_PROMPT = """
+너는 재무제표 질의응답 도우미다.
+반드시 아래 규칙을 지켜라.
+
+1. 제공된 조회 결과만 사용하라.
+2. 계정명과 금액을 정확히 매칭하라.
+3. 추측하지 마라.
+4. 질문이 여러 계정을 묻는 경우 각각 따로 답하라.
+5. 당기 금액을 우선 답하라.
+6. 전기 금액은 질문이 비교를 요구할 때만 사용하라.
+7. 조회 결과에 없는 값은 말하지 마라.
+8. 답변은 한국어로 간단명료하게 작성하라.
+"""
+
+
+def build_financial_statement_sql_user_prompt(result: SearchResult) -> str:
+    context_lines: list[str] = []
+
+    if result.report_year is not None:
+        context_lines.append(f"{result.report_year}년 재무제표 조회 결과")
+
+    for row in result.rows:
+        account = str(row.get("topic") or row.get("account_name_normalized") or "항목")
+        statement_type = str(row.get("sub_section") or "재무제표")
+        content = str(row.get("content") or "")
+
+        current_amount = None
+        prior_amount = None
+
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("당기금액:"):
+                current_amount = line.replace("당기금액:", "").strip()
+            elif line.startswith("전기금액:"):
+                prior_amount = line.replace("전기금액:", "").strip()
+
+        try:
+            current_amount_fmt = f"{int(float(current_amount)):,}" if current_amount not in (None, "", "None") else "-"
+        except Exception:
+            current_amount_fmt = str(current_amount)
+
+        try:
+            prior_amount_fmt = f"{int(float(prior_amount)):,}" if prior_amount not in (None, "", "None") else "-"
+        except Exception:
+            prior_amount_fmt = str(prior_amount)
+
+        context_lines.append(
+            f"- {statement_type} | {account} | 당기 {current_amount_fmt} | 전기 {prior_amount_fmt}"
+        )
+
+    context_text = "\n".join(context_lines)
+
+    targets_text = ""
+    if result.selected_keywords:
+        targets_text = "\n".join(f"- {kw}" for kw in result.selected_keywords)
+
+    if targets_text:
+        return f"""질문:
+            {result.original_query}
+
+            질문에서 답해야 할 계정:
+            {targets_text}
+
+            조회 결과:
+            {context_text}
+
+            위 조회 결과만 사용해서 답하라.
+            계정별 금액을 정확히 매칭해서 답하라.
+            """
+    return f"""질문:
+        {result.original_query}
+
+        조회 결과:
+        {context_text}
+
+        위 조회 결과만 사용해서 답하라.
+        계정명과 금액을 정확히 매칭해서 답하라.
+        """
+
+
 def generate_answer(result: SearchResult, thinking: bool = False) -> tuple[str, str, str]:
     generator = get_generator()
-    generation = generator.generate(SYSTEM_PROMPT.strip(), build_rag_user_prompt(result), thinking=thinking)
+
+    if result.auto_section_type == "financial_statement_sql":
+        system_prompt = FINANCIAL_STATEMENT_SQL_PROMPT.strip()
+        user_prompt = build_financial_statement_sql_user_prompt(result)
+    else:
+        system_prompt = SYSTEM_PROMPT.strip()
+        user_prompt = build_rag_user_prompt(result)
+
+    generation = generator.generate(system_prompt, user_prompt, thinking=thinking)
     cleaned = clean_generated_answer(generation.answer)
     if not cleaned:
         cleaned = build_fallback_answer(result)
@@ -109,9 +237,17 @@ def generate_answer(result: SearchResult, thinking: bool = False) -> tuple[str, 
 
 def stream_answer(result: SearchResult, thinking: bool = False) -> str:
     generator = get_generator()
+
+    if result.auto_section_type == "financial_statement_sql":
+        system_prompt = FINANCIAL_STATEMENT_SQL_PROMPT.strip()
+        user_prompt = build_financial_statement_sql_user_prompt(result)
+    else:
+        system_prompt = SYSTEM_PROMPT.strip()
+        user_prompt = build_rag_user_prompt(result)
+
     streamer, thread = generator.stream_generate(
-        SYSTEM_PROMPT.strip(),
-        build_rag_user_prompt(result),
+        system_prompt,
+        user_prompt,
         thinking=thinking,
     )
 
@@ -130,10 +266,12 @@ def stream_answer(result: SearchResult, thinking: bool = False) -> str:
     cleaned = clean_generated_answer("".join(chunks))
     if not cleaned:
         cleaned = build_fallback_answer(result)
+
     if cleaned != shown:
         suffix = cleaned[len(shown):] if cleaned.startswith(shown) else cleaned
         if suffix:
             print(suffix, end="", flush=True)
+
     print()
     return cleaned
 
@@ -164,10 +302,62 @@ def extract_table_lines(content: str) -> list[str]:
 
 def build_financial_statement_answer(query: str, rows: list[dict[str, object]]) -> str | None:
     compact_query = re.sub(r"\s+", "", query)
-    if not FINANCIAL_QUERY_HINT_RE.search(compact_query):
+    has_fs_sql_rows = any(
+        str(row.get("section_type", "")) == "financial_statement_sql_row"
+        for row in rows
+    )
+    if not FINANCIAL_QUERY_HINT_RE.search(compact_query) and not has_fs_sql_rows:
         return None
 
-    fs_row = next((row for row in rows if str(row.get("section_type", "")) == "financial_statement"), None)
+    if not rows:
+        return None
+
+    section_types = {str(row.get("section_type", "")) for row in rows}
+
+    # 새 SQL 경로 전용 처리
+    if "financial_statement_sql_row" in section_types:
+        year = rows[0].get("report_year")
+        parts = []
+
+        for row in rows:
+            account = str(row.get("topic") or row.get("account_name_normalized") or "항목")
+            content = str(row.get("content") or "")
+
+            current_amount = None
+            prior_amount = None
+
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("당기금액:"):
+                    current_amount = line.replace("당기금액:", "").strip()
+                elif line.startswith("전기금액:"):
+                    prior_amount = line.replace("전기금액:", "").strip()
+
+            if current_amount not in (None, "", "None"):
+                try:
+                    current_amount_fmt = f"{int(float(current_amount)):,}"
+                except Exception:
+                    current_amount_fmt = str(current_amount)
+                parts.append(f"{account}은 {current_amount_fmt}원")
+            elif prior_amount not in (None, "", "None"):
+                try:
+                    prior_amount_fmt = f"{int(float(prior_amount)):,}"
+                except Exception:
+                    prior_amount_fmt = str(prior_amount)
+                parts.append(f"{account}은 {prior_amount_fmt}원")
+
+        if parts:
+            if year is not None:
+                return f"{year}년 " + ", ".join(parts) + "입니다."
+            return ", ".join(parts) + "입니다."
+
+        return None
+
+    # 기존 chunks 경로 유지
+    fs_row = next(
+        (row for row in rows if str(row.get("section_type", "")) in {"financial_statement", "financial_statement_row"}),
+        None,
+    )
     if fs_row is None:
         return None
 
@@ -179,7 +369,8 @@ def build_financial_statement_answer(query: str, rows: list[dict[str, object]]) 
         return None
 
     targets = [
-        key for key in ("유동자산", "비유동자산", "현금및현금성자산", "매출채권", "재고자산") if key in compact_query
+        key for key in ("유동자산", "비유동자산", "현금및현금성자산", "매출채권", "재고자산", "매출액", "영업이익", "당기순이익")
+        if key in compact_query
     ]
     matched = [line for line in table_lines if any(target in re.sub(r"\s+", "", line) for target in targets)]
     if not matched:
@@ -198,7 +389,7 @@ def clean_generated_answer(answer: str) -> str:
     text = re.sub(r"\[Retrieved Context\].*?(?=\n\n|$)", "", text, flags=re.DOTALL)
     text = re.sub(r"(?:^|\n)\s*(?:file_name|report_year|major_section|sub_section|chunk_key)\s*:\s*.*", "", text)
     text = re.sub(r"(?:^|\n)\s*(?:연도|섹션|본문)\s*:\s*", "\n", text)
-    text = re.sub(r"^\s*-\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*-\s+(?![\d(])", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -213,9 +404,54 @@ def trim_streaming_artifacts(text: str) -> str:
 
 
 def build_fallback_answer(result: SearchResult) -> str:
+    print("!@!@!@!@!@!@!@!@!@!@!@!@!@!@!@!@!")
     if not result.rows:
         return "검색 결과가 없어 답변을 생성할 수 없습니다."
 
+    # 재무제표 SQL 경로는 LLM 요약 대신 규칙 기반으로 답변 생성
+    if result.auto_section_type == "financial_statement_sql":
+        year = result.report_year
+        parts = []
+
+        
+
+        for row in result.rows:
+            account = row.get("topic") or row.get("account_name_normalized") or "항목"
+            content = str(row.get("content", ""))
+
+            current_amount = None
+            prior_amount = None
+
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("당기금액:"):
+                    value = line.replace("당기금액:", "").strip()
+                    current_amount = value
+                elif line.startswith("전기금액:"):
+                    value = line.replace("전기금액:", "").strip()
+                    prior_amount = value
+
+            if current_amount is not None:
+                try:
+                    current_amount_fmt = f"{int(float(current_amount)):,}"
+                except Exception:
+                    current_amount_fmt = str(current_amount)
+                parts.append(f"{account}은 {current_amount_fmt}원")
+            elif prior_amount is not None:
+                try:
+                    prior_amount_fmt = f"{int(float(prior_amount)):,}"
+                except Exception:
+                    prior_amount_fmt = str(prior_amount)
+                parts.append(f"{account}은 {prior_amount_fmt}원")
+
+        if parts:
+            if year is not None:
+                return f"{year}년 " + ", ".join(parts) + "입니다."
+            return ", ".join(parts) + "입니다."
+
+        return "재무제표 조회 결과는 찾았지만 금액을 정리하지 못했습니다."
+
+    # 기존 주석 / 의미검색 경로는 그대로 유지
     top = result.rows[0]
     raw = str(top.get("content", ""))
     _, summary = synthesize_grounded_summary(result.semantic_query, [top])
@@ -313,14 +549,15 @@ def run_single(
             print("=== Streaming Answer ===")
             answer = stream_answer(result, thinking=thinking)
         else:
+            print("=== Generated Answer ===")
             answer, _, _ = generate_answer(result, thinking=thinking)
     else:
         if stream:
             print("[안내] --stream은 --llm 모드에서만 적용됩니다.")
+        print("=== Generating Grounded Answer ===")
         answer = generate_grounded_answer(result)
 
     if not (use_llm and stream):
-        print("=== Generated Answer ===")
         print(answer)
 
 
