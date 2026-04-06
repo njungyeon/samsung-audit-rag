@@ -263,8 +263,7 @@ poetry run streamlit run app/streamlit_app.py
 기본 Tool:
 
 - `search_audit_report(query, k)`
-- `get_specific_section(report_year, sub_section, k)`
-- `compare_years(topic, year_a, year_b)`
+- `lookup_note_table_value`
 
 ## 청킹 전략
 
