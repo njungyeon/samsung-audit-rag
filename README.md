@@ -1,4 +1,4 @@
-# samsung-audit-rag-structured
+# 삼성 감사 보고서 RAG 시스템 (5조)
 
 삼성전자 감사보고서 `.htm/.html` 파일을 대상으로, **통합형 구조(PostgreSQL + pgvector)** 로
 
@@ -19,48 +19,70 @@
 - `documents`: 원본 파일과 구조화 JSON 저장
 - `chunks`: 검색 단위 text + 메타데이터 + embedding 저장
 
-## 파싱 구조
+## 프로젝트 구조
 
-이 프로젝트는 감사보고서 구조를 아래처럼 봅니다.
+이 프로젝트는 다음과 같은 폴더 구조로 구성되어 있습니다. 각 폴더와 파일의 역할을 설명합니다.
 
-- `h2.SECTION-1`
-  - 독립된 감사인의 감사보고서
-  - (첨부)재무제표
-- `(첨부)재무제표` 아래 table 제목 패턴
-  - 재무상태표
-  - 손익계산서
-  - 포괄손익계산서
-  - 자본변동표
-  - 현금흐름표
-- `h3.SECTION-2`
-  - 주석
-- 주석 아래 번호형 소제목
-  - 1. 일반적 사항
-  - 2. 중요한 회계처리방침
-  - 3. 중요한 회계추정 및 가정
-  - ...
-
-## 폴더 구조
-
-```bash
-samsung-audit-rag-structured/
-├─ app/
-│  ├─ config.py
-│  ├─ db.py
-│  ├─ parser.py
-│  ├─ chunker.py
-│  ├─ embedder.py
-│  ├─ ingest.py
-│  └─ search.py
-├─ data/
-│  ├─ html/
-│  └─ parsed/
-├─ sql/
-│  └─ init.sql
-├─ docker-compose.yml
-├─ pyproject.toml
-└─ .env.example
 ```
+samsung-audit-rag/
+├─ app/                          # 메인 애플리케이션 코드
+│  ├─ __init__.py               # 패키지 초기화
+│  ├─ config.py                 # 설정 관리 (환경 변수, DB 연결 등)
+│  ├─ db.py                     # 데이터베이스 연결 및 쿼리 함수
+│  ├─ parser.py                 # HTML 파일 파싱 및 구조화
+│  ├─ chunker.py                # 텍스트 청킹 (섹션별 분할)
+│  ├─ embedder.py               # 텍스트 임베딩 생성
+│  ├─ ingest.py                 # 데이터 수집 및 적재 파이프라인
+│  ├─ search.py                 # 벡터 검색 기능
+│  ├─ qa.py                     # 질문 답변 (RAG) 기능
+│  ├─ generator.py              # LLM 기반 답변 생성
+│  └─ streamlit_app.py          # Streamlit 웹 인터페이스
+├─ data/                         # 데이터 파일들
+│  ├─ html/                     # 원본 감사보고서 HTML 파일들
+│  └─ parsed/                   # 파싱된 JSON 파일들
+├─ sql/                         # 데이터베이스 스키마
+│  └─ init.sql                  # 초기 DB 설정 SQL
+├─ tests/                       # 테스트 코드
+│  └─ test_data_schema.py       # 데이터 스키마 테스트
+├─ docker-compose.yml           # Docker Compose 설정 (PostgreSQL)
+├─ pyproject.toml               # Poetry 의존성 관리
+└─ README.md                    # 이 파일
+```
+
+## 파이프라인 설명
+
+이 시스템은 감사보고서를 처리하고 질문에 답변하는 RAG (Retrieval-Augmented Generation) 파이프라인을 구현합니다. 전체 흐름은 다음과 같습니다:
+
+1. **데이터 수집 (Ingest)**: HTML 파일을 읽어들입니다.
+2. **파싱 (Parsing)**: HTML을 구조화된 JSON으로 변환합니다. EUC-KR 인코딩 처리와 방어적 파싱을 사용합니다.
+3. **청킹 (Chunking)**: 긴 텍스트를 검색에 적합한 작은 단위로 분할합니다. 재무제표는 표 단위, 주석은 섹션별로 나눕니다.
+4. **임베딩 (Embedding)**: 텍스트 청크를 벡터로 변환합니다. 검색을 위한 벡터화입니다.
+5. **저장 (Storage)**: PostgreSQL에 문서 메타데이터와 임베딩을 저장합니다.
+6. **검색 (Search)**: 사용자의 질문을 벡터화하여 유사한 청크를 찾습니다.
+7. **생성 (Generation)**: 검색된 컨텍스트를 바탕으로 LLM이 답변을 생성합니다.
+
+이 파이프라인은 Streamlit 앱을 통해 웹 인터페이스로 사용할 수 있습니다.
+
+## 의사결정 이유
+
+- **통합형 DB 선택**: 10년치 데이터 규모가 크지 않아 별도 벡터 DB (Pinecone 등) 없이 PostgreSQL + pgvector로 충분. 관리 복잡성 감소.
+- **HTML 파싱 방식**: 감사보고서가 오래된 HTML이라 lxml 우선, 실패 시 html5lib, 최후 html.parser로 fallback. 안정성 우선.
+- **청킹 전략**: 재무제표는 표 구조 유지하면서 행 단위 묶음, 주석은 논리적 섹션별. 검색 정확도 향상.
+- **임베딩 모델**: 한국어 지원이 좋은 모델 선택 (예: KoBERT 등). 도메인 특성 고려.
+- **RAG 구현**: 검색 기반 답변으로 hallucination 방지, LLM은 생성 보조로 사용.
+
+## 시행착오
+
+개발 과정에서 겪은 주요 문제와 해결 방법을 공유합니다:
+
+- **인코딩 문제**: 초기 EUC-KR 디코딩 실패로 텍스트 깨짐. chardet 라이브러리로 자동 감지 추가.
+- **HTML 파싱 실패**: 일부 파일에서 lxml이 실패. 다중 파서 fallback 구현으로 해결.
+- **청킹 단위**: 처음 표 전체 청킹 시 검색 부정확. 행 단위 묶음으로 변경.
+- **임베딩 성능**: 초기 모델로 한국어 지원 부족. 한국어 특화 모델로 교체.
+- **DB 쿼리 최적화**: 초기 검색 속도 느림. 인덱스 추가와 쿼리 튜닝으로 개선.
+- **LLM 통합**: 스트리밍 구현 시 토큰 단위 출력 어려움. 라이브러리 변경으로 해결.
+
+이러한 시행착오를 통해 시스템의 안정성과 성능을 향상시켰습니다.
 
 ## 0. macOS: pyenv / Poetry 설치
 
