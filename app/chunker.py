@@ -309,10 +309,15 @@ def _note_table_cell_chunks(
             raw_values = row.get("raw_values", {}) or {}
             values = row.get("values", {}) or {}
 
+            row_path = " > ".join(row.get("row_path", []) or [])
+            row_group = str(row.get("row_group") or "")
+
             for col_label, raw_value, numeric_value in _iter_table_cells(raw_values, values):
                 content = (
                     f"[주석 {note_no}. {note_title} - 테이블 셀]\n"
                     f"표번호: {table_idx}\n"
+                    f"행그룹: {row_group}\n"
+                    f"행경로: {row_path}\n"
                     f"행: {row_label}\n"
                     f"열: {col_label}\n"
                     f"값(raw): {raw_value}\n"
