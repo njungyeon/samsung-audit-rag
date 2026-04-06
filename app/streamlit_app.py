@@ -19,6 +19,8 @@ AGENT_SYSTEM_PROMPT = """당신은 삼성전자 감사보고서 분석 에이전
 4. 질문 단어를 반복한 동어반복 문장을 쓰지 않는다.
 5. '기타사항에 기타사항이 포함되어' 같은 어색한 표현을 금지한다.
 6. 질문이 단일 수치만 묻는 경우에는 요청된 값 하나만 먼저 답하고, 주변 표 항목은 덧붙이지 않는다.
+7. 금액, 잔액, 연이자율, 상환예정금액, 만기구조처럼 주석 표의 특정 셀 값을 묻는 질문은 lookup_note_table_value를 우선 사용한다.
+8. 재무제표의 특정 계정 금액을 묻는 질문은 일반 검색보다 구조화 조회 tool이 있으면 그 tool을 우선 사용한다.
 """
 
 SINGLE_VALUE_QUERY_HINT_RE = re.compile(r"얼마|금액|잔액|한도|지급액|전입액|당기말|전기말|기말|기초")
@@ -156,6 +158,61 @@ def tool_compare_years(topic: str, year_a: int, year_b: int) -> str:
     return "\n".join(lines)
 
 
+def tool_lookup_note_table_value(
+    report_year: int | None = None,
+    note_title: str | None = None,
+    row_label: str | None = None,
+    col_label: str | None = None,
+    k: int = 3,
+) -> str:
+    import re
+    from app.search import lookup_note_table_value
+
+    rows = lookup_note_table_value(
+        report_year=report_year,
+        note_title=note_title,
+        row_label=row_label,
+        col_label=col_label,
+        limit=max(1, min(k, 5)),
+    )
+
+    if not rows:
+        return "조건에 맞는 주석 표 셀을 찾지 못했습니다."
+
+    def extract_field(content: str, label: str) -> str:
+        pattern = rf"{re.escape(label)}\s*:\s*(.*)"
+        m = re.search(pattern, content)
+        return m.group(1).strip() if m else ""
+
+    lines: list[str] = []
+
+    for row in rows:
+        content = str(row.get("content") or "")
+
+        row_text = extract_field(content, "행")
+        col_text = extract_field(content, "열")
+        raw_value = extract_field(content, "값(raw)")
+        numeric_value = extract_field(content, "값(numeric)")
+        unit = extract_field(content, "단위")
+
+        lines.append(
+            "\n".join(
+                [
+                    f"연도: {row.get('report_year')}",
+                    f"주석: {row.get('note_title')}",
+                    f"세부섹션: {row.get('sub_section')}",
+                    f"행: {row_text or '-'}",
+                    f"열: {col_text or '-'}",
+                    f"값(raw): {raw_value or '-'}",
+                    f"값(numeric): {numeric_value or '-'}",
+                    f"단위: {unit or '-'}",
+                ]
+            )
+        )
+
+    return "\n\n".join(lines)
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -204,12 +261,31 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+    "type": "function",
+    "function": {
+        "name": "lookup_note_table_value",
+        "description": "주석 표에서 특정 행/열에 해당하는 값을 직접 찾는다. 금액, 잔액, 연이자율, 상환예정금액 같은 표 질의에 우선 사용한다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "report_year": {"type": "integer", "description": "조회할 연도"},
+                "note_title": {"type": "string", "description": "주석 제목 예: 사채, 리스, 차입금"},
+                "row_label": {"type": "string", "description": "행 이름 예: 2019년, 1년 이내"},
+                "col_label": {"type": "string", "description": "열 이름 예: 상환 예정 금액, 연이자율"},
+                "k": {"type": "integer", "description": "반환 개수, 기본 3"}
+            },
+            "required": []
+        },
+    },
+},
 ]
 
 TOOL_FUNCS = {
     "search_audit_report": tool_search_audit_report,
-    "get_specific_section": tool_get_specific_section,
-    "compare_years": tool_compare_years,
+    # "get_specific_section": tool_get_specific_section,
+    # "compare_years": tool_compare_years,
+    "lookup_note_table_value": tool_lookup_note_table_value,
 }
 
 
@@ -222,6 +298,8 @@ def run_agentic_react(user_query: str, max_turns: int = 4) -> tuple[list[dict[st
 
     tool_traces: list[dict[str, str]] = []
 
+    print("?DFASDFASDFASDFASDFASDFASDFASDF")
+
     for _ in range(max_turns):
         raw = generator.generate_from_messages(
             messages,
@@ -229,8 +307,10 @@ def run_agentic_react(user_query: str, max_turns: int = 4) -> tuple[list[dict[st
             tools=TOOLS,
             skip_special_tokens=False,
         )
-
+        print(f"Raw model output:\n{raw}\n")
         tool_matches = TOOL_CALL_RE.findall(raw)
+        print(f"tool_matches:\n{tool_matches}\n")
+        
         if not tool_matches:
             break
 
