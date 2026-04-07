@@ -20,6 +20,8 @@
 - `documents`: 원본 파일과 구조화 JSON 저장
 - `chunks`: 검색 단위 text + 메타데이터 + embedding 저장
 
+---
+
 ## 프로젝트 구조
 
 이 프로젝트는 다음과 같은 폴더 구조로 구성되어 있습니다. 각 폴더와 파일의 역할을 설명합니다.
@@ -49,6 +51,7 @@ samsung-audit-rag/
 ├─ pyproject.toml               # Poetry 의존성 관리
 └─ README.md                    # 이 파일
 ```
+---
 
 ## 파이프라인 설명
 
@@ -64,7 +67,9 @@ samsung-audit-rag/
 
 이 파이프라인은 Streamlit 앱을 통해 웹 인터페이스로 사용할 수 있습니다.
 
-## 의사결정 이유
+---
+
+## 각 기술 선택 이유
 
 - **통합형 DB 선택**: 10년치 데이터 규모가 크지 않아 별도 벡터 DB (Pinecone 등) 없이 PostgreSQL + pgvector로 충분. 관리 복잡성 감소.
 - **HTML 파싱 방식**: 감사보고서가 오래된 HTML이라 lxml 우선, 실패 시 html5lib, 최후 html.parser로 fallback. 안정성 우선.
@@ -74,7 +79,7 @@ samsung-audit-rag/
 
 ## 시행착오
 
-개발 과정에서 겪은 주요 문제와 해결 방법을 공유합니다:
+개발 과정에서 겪은 주요 문제와 해결 방법들:
 
 - **인코딩 문제**: 초기 EUC-KR 디코딩 실패로 텍스트 깨짐. chardet 라이브러리로 자동 감지 추가.
 - **HTML 파싱 실패**: 일부 파일에서 lxml이 실패. 다중 파서 fallback 구현으로 해결.
@@ -84,6 +89,8 @@ samsung-audit-rag/
 - **LLM 통합**: 스트리밍 구현 시 토큰 단위 출력 어려움. 라이브러리 변경으로 해결.
 
 이러한 시행착오를 통해 시스템의 안정성과 성능을 향상시켰습니다.
+
+---
 
 ## 0. macOS: pyenv / Poetry 설치
 
@@ -130,8 +137,6 @@ poetry --version
 ```
 
 ## 1. Python/Poetry 환경 구성
-
-요청하신 순서대로 실행하면 됩니다.
 
 ```bash
 pyenv install 3.12
@@ -182,6 +187,8 @@ poetry run python -m app.ingest
 - `documents.parsed_json` 에 구조화 JSON 저장
 - `data/parsed/*.json` 에 파싱 결과 파일 저장
 - `chunks` 테이블에 청크 + 임베딩 저장
+
+---
 
 ## 5. 검색 테스트
 
@@ -247,6 +254,8 @@ poetry run python -m app.qa --test --generate --llm
 - 각 질문의 상위 검색 결과 요약
 - 선택적으로 생성된 LLM 답변
 
+---
+
 ## 7. Streamlit 챗봇 (RAG 스트리밍 + Agentic ReAct)
 
 실습 5회 구조처럼 Streamlit 화면에서 질문을 던지고, 답변을 스트리밍으로 받을 수 있습니다.
@@ -266,6 +275,8 @@ poetry run streamlit run app/streamlit_app.py
 - `search_audit_report(query, k)`
 - `get_specific_section(report_year, sub_section, k)`
 - `compare_years(topic, year_a, year_b)`
+
+---
 
 ## 청킹 전략
 
@@ -307,8 +318,9 @@ poetry run streamlit run app/streamlit_app.py
 업로드된 `감사보고서_2014.htm` 1개를 `data/html/` 에 예시로 넣어두었습니다.
 나머지 9개 파일도 같은 폴더에 넣으면 같은 방식으로 적재됩니다.
 
+---
 
-## 이번 수정 사항
+## 수정 사항
 
 - 파일명 기반 연도 추출을 우선 적용해 `2014`가 `2019`로 잘못 잡히는 문제를 수정했습니다.
 - `SECTION-1 / SECTION-2` 구조를 활용해 상위 섹션을 다시 분류했습니다.
